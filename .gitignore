@@ -32,6 +32,7 @@ staticfiles/
 # Virtual Environments
 venv/
 .venv/
+venv312/
 env/
 ENV/
 env.bak/

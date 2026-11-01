@@ -3,3 +3,7 @@ djangorestframework>=3.16,<4.0
 djangorestframework-simplejwt>=5.5,<6.0
 psycopg[binary]>=3.2,<4.0
 python-dotenv>=1.1,<2.0
+
+# Audio Agent dependencies
+faster-whisper
+requests

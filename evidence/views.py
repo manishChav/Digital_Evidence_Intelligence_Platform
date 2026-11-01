@@ -17,6 +17,17 @@ from custody.services import custody
 
 from rest_framework import status
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+from evidence.models import AudioAnalysisResult
+from evidence.audio_services import (
+    calculate_file_sha256,
+    transcribe_audio,
+    analyze_audio_transcript,
+)
+
 class EvidenceListCreateView(generics.ListCreateAPIView):
     serializer_class = EvidenceSerializer
     permission_classes = [IsAuthenticated]
@@ -175,3 +186,192 @@ class EvidenceIntegrityVerificationView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+class AudioEvidenceAccessMixin:
+    """Restrict audio operations to evidence the user may access."""
+
+    def get_audio_evidence(self, request, pk):
+        u = request.user
+        queryset = Evidence.objects.select_related("case")
+
+        if u.role in [User.Role.ADMIN, User.Role.EVIDENCE_OFFICER]:
+            pass
+        elif u.role == User.Role.INVESTIGATING_OFFICER:
+            queryset = queryset.filter(case__investigating_officer=u)
+        elif u.role == User.Role.FORENSIC_OFFICER:
+            queryset = queryset.filter(case__forensic_officer=u)
+        elif u.role == User.Role.SUPERVISOR:
+            queryset = queryset.filter(case__supervisor=u)
+        else:
+            queryset = queryset.none()
+
+        obj = queryset.filter(pk=pk).first()
+
+        if obj is None:
+            raise NotFound("Evidence not found or access denied.")
+
+        if obj.evidence_type != Evidence.Type.AUDIO:
+            raise ValidationError(
+                {"evidence": "This operation is only available for audio evidence."}
+            )
+
+        return obj
+
+    def verify_audio_integrity(self, obj, request):
+        try:
+            calculated_hash = calculate_file_sha256(obj.file.path)
+        except (OSError, ValueError):
+            audit(
+                request.user,
+                "AUDIO_INTEGRITY_CHECK_FAILED",
+                {"evidence_id": obj.id},
+                request,
+            )
+            raise ValidationError(
+                {"file": "The audio evidence file is unavailable."}
+            )
+
+        verified = calculated_hash == obj.sha256_hash
+
+        audit(
+            request.user,
+            "AUDIO_INTEGRITY_VERIFIED" if verified
+            else "AUDIO_INTEGRITY_MISMATCH",
+            {
+                "evidence_id": obj.id,
+                "stored_sha256": obj.sha256_hash,
+                "calculated_sha256": calculated_hash,
+            },
+            request,
+        )
+
+        custody(
+            obj,
+            request.user,
+            "AUDIO_INTEGRITY_VERIFIED" if verified
+            else "AUDIO_INTEGRITY_MISMATCH",
+            request,
+            calculated_hash,
+        )
+
+        if not verified:
+            raise ValidationError(
+                {"integrity": "Audio evidence integrity verification failed."}
+            )
+
+        return calculated_hash
+
+
+class AudioTranscriptionView(AudioEvidenceAccessMixin, APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        obj = self.get_audio_evidence(request, pk)
+        self.verify_audio_integrity(obj, request)
+
+        try:
+            transcription = transcribe_audio(obj.file.path)
+        except Exception:
+            logger.exception(
+
+            "Audio analysis failed for evidence ID %s",
+            obj.id,
+    )
+        return Response(
+        {"detail": "Audio analysis failed. Check server logs."},
+        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )
+
+        audit(
+            request.user,
+            "AUDIO_TRANSCRIPTION_COMPLETED",
+            {"evidence_id": obj.id},
+            request,
+        )
+
+        return Response({
+            "evidence_id": obj.id,
+            "transcription": transcription,
+        })
+
+
+class AudioAnalysisView(AudioEvidenceAccessMixin, APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        obj = self.get_audio_evidence(request, pk)
+        current_hash = self.verify_audio_integrity(obj, request)
+
+        try:
+            transcription = transcribe_audio(obj.file.path)
+            analysis = analyze_audio_transcript(
+                transcription["full_text"],
+                obj.id,
+            )
+        except Exception:
+            audit(
+                request.user,
+                "AUDIO_ANALYSIS_FAILED",
+                {"evidence_id": obj.id},
+                request,
+            )
+            return Response(
+                {"detail": "Audio analysis failed. Check server logs."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        result, created = AudioAnalysisResult.objects.update_or_create(
+            evidence=obj,
+            defaults={
+                "transcription": transcription,
+                "analysis": analysis,
+                "processed_hash": current_hash,
+            },
+        )
+
+        obj.status = Evidence.Status.ANALYZED
+        obj.save(update_fields=["status"])
+
+        custody(
+            obj,
+            request.user,
+            "AUDIO_ANALYSIS_COMPLETED",
+            request,
+            current_hash,
+        )
+        audit(
+            request.user,
+            "AUDIO_ANALYSIS_COMPLETED",
+            {"evidence_id": obj.id, "result_id": result.id},
+            request,
+        )
+
+        return Response({
+            "evidence_id": obj.id,
+            "transcription": result.transcription,
+            "analysis": result.analysis,
+            "processed_hash": result.processed_hash,
+            "created": created,
+        })
+
+
+class AudioAnalysisResultView(AudioEvidenceAccessMixin, APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        obj = self.get_audio_evidence(request, pk)
+
+        try:
+            result = obj.audio_analysis
+        except AudioAnalysisResult.DoesNotExist:
+            raise NotFound("Audio analysis has not been generated yet.")
+
+        return Response({
+            "evidence_id": obj.id,
+            "case_id": obj.case_id,
+            "transcription": result.transcription,
+            "analysis": result.analysis,
+            "processed_hash": result.processed_hash,
+            "created_at": result.created_at,
+            "updated_at": result.updated_at,
+        })    
