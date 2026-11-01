@@ -1,3 +1,4 @@
+import hashlib
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import generics
@@ -13,6 +14,8 @@ from evidence.services import validate_file, sha256_file, file_type
 from accounts.models import User
 from audit.services import audit
 from custody.services import custody
+
+from rest_framework import status
 
 class EvidenceListCreateView(generics.ListCreateAPIView):
     serializer_class = EvidenceSerializer
@@ -34,7 +37,15 @@ class EvidenceListCreateView(generics.ListCreateAPIView):
         if not f: raise ValidationError({"file": "Upload a file using multipart form data."})
         validate_file(f)
         h = sha256_file(f)
-        obj = serializer.save(original_filename=f.name[:255], evidence_type=file_type(f.name), mime_type=getattr(f, "content_type", "") or "", file_size=f.size, sha256_hash=h, uploaded_by=u)
+        obj = serializer.save(
+    case_id=self.request.data.get("case"),
+    original_filename=f.name[:255],
+    evidence_type=file_type(f.name),
+    mime_type=getattr(f, "content_type", "") or "",
+    file_size=f.size,
+    sha256_hash=h,
+    uploaded_by=u
+)
         custody(obj, u, "UPLOADED", self.request, h)
         audit(u, "EVIDENCE_UPLOADED", {"evidence_id": obj.id, "case_id": obj.case_id, "sha256": h}, self.request)
 
@@ -80,3 +91,87 @@ class EvidenceReviewView(APIView):
         custody(obj, u, "FORENSIC_REVIEWED", request, obj.sha256_hash)
         audit(u, "EVIDENCE_REVIEWED", {"evidence_id": obj.id}, request)
         return Response(EvidenceSerializer(obj).data)
+
+class EvidenceIntegrityVerificationView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        u = self.request.user
+        q = Evidence.objects.all()
+
+        if u.role in [User.Role.ADMIN, User.Role.EVIDENCE_OFFICER]:
+            return q
+        if u.role == User.Role.INVESTIGATING_OFFICER:
+            return q.filter(case__investigating_officer=u)
+        if u.role == User.Role.FORENSIC_OFFICER:
+            return q.filter(case__forensic_officer=u)
+        if u.role == User.Role.SUPERVISOR:
+            return q.filter(case__supervisor=u)
+
+        return q.none()
+
+    def post(self, request, pk):
+        obj = self.get_queryset().filter(pk=pk).first()
+
+        if obj is None:
+            return Response(
+                {"detail": "Evidence not found or access denied."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            obj.file.open("rb")
+            try:
+                h = hashlib.sha256()
+                for chunk in obj.file.chunks():
+                    h.update(chunk)
+                calculated_hash = h.hexdigest()
+            finally:
+                obj.file.close()
+        except (OSError, ValueError):
+            audit(
+                request.user,
+                "EVIDENCE_INTEGRITY_VERIFICATION_FAILED",
+                {"evidence_id": obj.id},
+                request,
+            )
+            return Response(
+                {"detail": "Evidence file is unavailable."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        verified = calculated_hash == obj.sha256_hash
+
+        event = (
+            "EVIDENCE_INTEGRITY_VERIFIED"
+            if verified
+            else "EVIDENCE_INTEGRITY_MISMATCH"
+        )
+        custody_event = "INTEGRITY_VERIFIED" if verified else "INTEGRITY_MISMATCH"
+
+        audit(
+            request.user,
+            event,
+            {
+                "evidence_id": obj.id,
+                "stored_sha256": obj.sha256_hash,
+                "calculated_sha256": calculated_hash,
+            },
+            request,
+        )
+        custody(obj, request.user, custody_event, request, calculated_hash)
+
+        return Response(
+            {
+                "evidence_id": obj.id,
+                "integrity_verified": verified,
+                "stored_sha256": obj.sha256_hash,
+                "calculated_sha256": calculated_hash,
+                "message": (
+                    "Evidence integrity verified successfully."
+                    if verified
+                    else "Evidence integrity mismatch detected."
+                ),
+            },
+            status=status.HTTP_200_OK,
+        )
